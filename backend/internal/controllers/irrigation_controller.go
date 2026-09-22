@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"strconv"
 	"time"
 
@@ -23,27 +24,93 @@ func NewIrrigationController() *IrrigationController {
 
 // ManualIrrigate godoc
 // @Summary 手动灌溉
-// @Description 触发手动灌溉
+// @Description 触发手动灌溉，需携带幂等键；同一键重复调用返回原执行记录；区域已有进行中任务或熔断中时返回冲突
 // @Tags 灌溉执行
 // @Security ApiKeyAuth
 // @Accept json
 // @Produce json
-// @Param zone_id body int true "区域ID"
+// @Param request body object{zone_id=int,idempotency_key=string} true "区域ID与幂等键"
 // @Success 200 {object} models.IrrigationLog
+// @Failure 409 {object} response.Response
 // @Router /api/irrigation/manual [post]
 func (c *IrrigationController) ManualIrrigate(ctx *gin.Context) {
 	var req struct {
-		ZoneID uint `json:"zone_id" binding:"required"`
+		ZoneID         uint   `json:"zone_id" binding:"required"`
+		IdempotencyKey string `json:"idempotency_key" binding:"required,max=100"`
 	}
 
 	if err := ctx.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(ctx, "Invalid request body")
+		response.BadRequest(ctx, "Invalid request body: zone_id and idempotency_key are required")
 		return
 	}
 
-	log, err := c.irrigationService.StartIrrigation(nil, &req.ZoneID, models.TriggerTypeManual)
+	log, _, err := c.irrigationService.StartIrrigation(nil, &req.ZoneID, models.TriggerTypeManual, req.IdempotencyKey)
 	if err != nil {
-		response.InternalServerError(ctx, err.Error())
+		switch {
+		case errors.Is(err, services.ErrZoneBusy), errors.Is(err, services.ErrBreakerOpen):
+			response.Conflict(ctx, err.Error())
+		default:
+			response.InternalServerError(ctx, err.Error())
+		}
+		return
+	}
+
+	response.Success(ctx, log)
+}
+
+// CompleteIrrigate godoc
+// @Summary 完成灌溉执行
+// @Description 完成一条进行中的灌溉记录，按结束时间计算实际时长和用水量；重复完成返回冲突；失败完成必须提供 error_message
+// @Tags 灌溉执行
+// @Security ApiKeyAuth
+// @Accept json
+// @Produce json
+// @Param id path int true "执行记录ID"
+// @Param request body object{success=bool,error_message=string,end_time=string} true "完成结果"
+// @Success 200 {object} models.IrrigationLog
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 409 {object} response.Response
+// @Router /api/irrigation/{id}/complete [post]
+func (c *IrrigationController) CompleteIrrigate(ctx *gin.Context) {
+	id, err := strconv.ParseUint(ctx.Param("id"), 10, 32)
+	if err != nil || id == 0 {
+		response.BadRequest(ctx, "Invalid irrigation log id")
+		return
+	}
+
+	var req struct {
+		Success      *bool   `json:"success" binding:"required"`
+		ErrorMessage *string `json:"error_message" binding:"omitempty,max=500"`
+		EndTime      *string `json:"end_time"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(ctx, "Invalid request body: success is required")
+		return
+	}
+
+	endTime := time.Now()
+	if req.EndTime != nil && *req.EndTime != "" {
+		parsed, err := time.Parse(time.RFC3339, *req.EndTime)
+		if err != nil {
+			response.BadRequest(ctx, "Invalid end_time format, expect RFC3339")
+			return
+		}
+		endTime = parsed
+	}
+
+	log, err := c.irrigationService.CompleteIrrigation(uint(id), *req.Success, endTime, req.ErrorMessage)
+	if err != nil {
+		switch {
+		case errors.Is(err, services.ErrLogNotFound):
+			response.NotFound(ctx, err.Error())
+		case errors.Is(err, services.ErrLogNotInProgress):
+			response.Conflict(ctx, err.Error())
+		case errors.Is(err, services.ErrCompletionErrorMsgNeeded), errors.Is(err, services.ErrEndTimeBeforeStart):
+			response.BadRequest(ctx, err.Error())
+		default:
+			response.InternalServerError(ctx, err.Error())
+		}
 		return
 	}
 

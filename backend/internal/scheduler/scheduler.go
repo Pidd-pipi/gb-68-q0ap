@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -11,20 +13,20 @@ import (
 )
 
 type IrrigationScheduler struct {
-	scheduleService  *services.ScheduleService
+	scheduleService   *services.ScheduleService
 	irrigationService *services.IrrigationService
-	sensorService   *services.SensorService
-	deviceService  *services.DeviceService
-	alertService   *services.AlertService
+	sensorService     *services.SensorService
+	deviceService     *services.DeviceService
+	alertService      *services.AlertService
 }
 
 func NewIrrigationScheduler() *IrrigationScheduler {
 	return &IrrigationScheduler{
-		scheduleService:  services.NewScheduleService(),
+		scheduleService:   services.NewScheduleService(),
 		irrigationService: services.NewIrrigationService(),
-		sensorService:   services.NewSensorService(),
-		deviceService:  services.NewDeviceService(),
-		alertService:   services.NewAlertService(),
+		sensorService:     services.NewSensorService(),
+		deviceService:     services.NewDeviceService(),
+		alertService:      services.NewAlertService(),
 	}
 }
 
@@ -75,8 +77,10 @@ func shouldExecuteTimedSchedule(schedule models.IrrigationSchedule, now time.Tim
 		return false
 	}
 
+	// 数据库 TIME 类型可能返回 "15:04:05"，统一归一化到 "15:04" 再比较
+	startTime := normalizeClock(schedule.StartTime)
 	nowTime := now.Format("15:04")
-	if schedule.StartTime == nowTime {
+	if startTime == nowTime {
 		switch schedule.RepeatMode {
 		case models.RepeatModeOnce:
 			return true
@@ -103,6 +107,15 @@ func shouldExecuteTimedSchedule(schedule models.IrrigationSchedule, now time.Tim
 	return false
 }
 
+func normalizeClock(s string) string {
+	for _, layout := range []string{"15:04:05", "15:04"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Format("15:04")
+		}
+	}
+	return s
+}
+
 func shouldExecuteConditionalSchedule(schedule models.IrrigationSchedule) bool {
 	if schedule.ZoneID == nil || schedule.HumidityThreshold == nil {
 		return false
@@ -119,14 +132,6 @@ func shouldExecuteConditionalSchedule(schedule models.IrrigationSchedule) bool {
 func (s *IrrigationScheduler) executeIrrigation(schedule models.IrrigationSchedule) {
 	logger.Info("Executing irrigation schedule", zap.Uint("schedule_id", schedule.ID))
 
-	if schedule.RainSensorID != nil {
-		rainfall, err := s.sensorService.CheckRecentRainfall(*schedule.RainSensorID, 2*time.Hour)
-		if err == nil && rainfall > 5.0 {
-			logger.Info("Skipping irrigation due to recent rainfall", zap.Float64("rainfall", rainfall))
-			return
-		}
-	}
-
 	var triggerType models.TriggerType
 	if schedule.Type == models.ScheduleTypeTimed {
 		triggerType = models.TriggerTypeTimed
@@ -134,22 +139,53 @@ func (s *IrrigationScheduler) executeIrrigation(schedule models.IrrigationSchedu
 		triggerType = models.TriggerTypeConditional
 	}
 
-	log, err := s.irrigationService.StartIrrigation(&schedule.ID, schedule.ZoneID, triggerType)
+	// 幂等键精确到分钟：调度器每分钟巡检，同一分钟内重复触发返回原记录
+	idempotencyKey := fmt.Sprintf("schedule-%d-%s", schedule.ID, time.Now().Format("20060102T1504"))
+
+	// 降雨保护在执行服务内统一处理：达到阈值只落跳过记录，不启动阀门
+	log, deduplicated, err := s.irrigationService.StartIrrigation(&schedule.ID, schedule.ZoneID, triggerType, idempotencyKey)
 	if err != nil {
+		if errors.Is(err, services.ErrZoneBusy) || errors.Is(err, services.ErrBreakerOpen) {
+			logger.Info("Irrigation start rejected",
+				zap.Uint("schedule_id", schedule.ID),
+				zap.Error(err),
+			)
+			return
+		}
 		logger.Error("Failed to start irrigation", zap.Error(err))
 		s.alertService.CreateIrrigationFailedAlert(schedule.ZoneID, "启动灌溉失败: "+err.Error())
 		return
 	}
 
-	duration := time.Duration(schedule.Duration) * time.Second
-	if schedule.Duration > 0 {
-		time.Sleep(duration)
+	if deduplicated {
+		logger.Info("Irrigation already started for this key",
+			zap.Uint("schedule_id", schedule.ID),
+			zap.Uint("log_id", log.ID),
+		)
+		return
+	}
 
-		waterUsage := float64(schedule.Duration) * 0.1
-		s.irrigationService.CompleteIrrigation(log.ID, true, &waterUsage, nil)
+	if log.Status == models.ExecutionStatusSkipped {
+		logger.Info("Irrigation skipped",
+			zap.Uint("schedule_id", schedule.ID),
+			zap.Uint("log_id", log.ID),
+		)
+		return
+	}
+
+	if schedule.Duration > 0 {
+		time.Sleep(time.Duration(schedule.Duration) * time.Second)
+
+		if _, err := s.irrigationService.CompleteIrrigation(log.ID, true, time.Now(), nil); err != nil {
+			logger.Error("Failed to complete irrigation", zap.Uint("log_id", log.ID), zap.Error(err))
+			return
+		}
 		logger.Info("Irrigation completed", zap.Uint("log_id", log.ID))
 	} else {
-		s.irrigationService.CompleteIrrigation(log.ID, false, nil, nil)
+		errMsg := "灌溉计划时长配置无效"
+		if _, err := s.irrigationService.CompleteIrrigation(log.ID, false, time.Now(), &errMsg); err != nil {
+			logger.Error("Failed to complete irrigation", zap.Uint("log_id", log.ID), zap.Error(err))
+		}
 	}
 }
 

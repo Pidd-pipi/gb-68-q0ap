@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -11,12 +12,14 @@ import (
 )
 
 type ZoneController struct {
-	zoneService *services.ZoneService
+	zoneService       *services.ZoneService
+	irrigationService *services.IrrigationService
 }
 
 func NewZoneController() *ZoneController {
 	return &ZoneController{
-		zoneService: services.NewZoneService(),
+		zoneService:       services.NewZoneService(),
+		irrigationService: services.NewIrrigationService(),
 	}
 }
 
@@ -37,14 +40,22 @@ func (c *ZoneController) List(ctx *gin.Context) {
 	response.Success(ctx, zones)
 }
 
+// ZoneDetailResponse 区域详情：基础信息 + 当前执行 + 熔断状态 + 最近记录
+type ZoneDetailResponse struct {
+	*models.IrrigationZone
+	CurrentExecution *models.IrrigationLog   `json:"current_execution"`
+	Breaker          *services.BreakerStatus `json:"breaker"`
+	RecentLogs       []models.IrrigationLog  `json:"recent_logs"`
+}
+
 // GetZone godoc
 // @Summary 获取灌溉区域详情
-// @Description 根据ID获取灌溉区域详情
+// @Description 根据ID获取灌溉区域详情，包含当前执行、熔断状态和最近执行记录
 // @Tags 灌溉区域
 // @Security ApiKeyAuth
 // @Produce json
 // @Param id path int true "区域ID"
-// @Success 200 {object} models.IrrigationZone
+// @Success 200 {object} controllers.ZoneDetailResponse
 // @Router /api/zones/{id} [get]
 func (c *ZoneController) Get(ctx *gin.Context) {
 	id, _ := strconv.ParseUint(ctx.Param("id"), 10, 32)
@@ -53,7 +64,27 @@ func (c *ZoneController) Get(ctx *gin.Context) {
 		response.NotFound(ctx, "Zone not found")
 		return
 	}
-	response.Success(ctx, zone)
+
+	detail := ZoneDetailResponse{
+		IrrigationZone: zone,
+		Breaker:        c.irrigationService.GetBreakerStatus(zone.ID),
+	}
+
+	current, err := c.irrigationService.GetCurrentExecution(zone.ID)
+	if err != nil {
+		response.InternalServerError(ctx, err.Error())
+		return
+	}
+	detail.CurrentExecution = current
+
+	recentLogs, err := c.irrigationService.GetIrrigationHistory(&zone.ID, time.Time{}, time.Time{}, 5)
+	if err != nil {
+		response.InternalServerError(ctx, err.Error())
+		return
+	}
+	detail.RecentLogs = recentLogs
+
+	response.Success(ctx, detail)
 }
 
 // CreateZone godoc
@@ -94,7 +125,7 @@ func (c *ZoneController) Create(ctx *gin.Context) {
 // @Router /api/zones/{id} [put]
 func (c *ZoneController) Update(ctx *gin.Context) {
 	id, _ := strconv.ParseUint(ctx.Param("id"), 10, 32)
-	
+
 	var updates map[string]interface{}
 	if err := ctx.ShouldBindJSON(&updates); err != nil {
 		response.BadRequest(ctx, "Invalid request body")
@@ -120,7 +151,7 @@ func (c *ZoneController) Update(ctx *gin.Context) {
 // @Router /api/zones/{id} [delete]
 func (c *ZoneController) Delete(ctx *gin.Context) {
 	id, _ := strconv.ParseUint(ctx.Param("id"), 10, 32)
-	
+
 	if err := c.zoneService.DeleteZone(uint(id)); err != nil {
 		response.NotFound(ctx, err.Error())
 		return

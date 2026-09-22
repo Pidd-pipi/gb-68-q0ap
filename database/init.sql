@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS irrigation_zones (
     name VARCHAR(100) NOT NULL,
     description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
 );
 
 -- 设备类型枚举
@@ -24,7 +25,8 @@ CREATE TABLE IF NOT EXISTS devices (
     last_heartbeat TIMESTAMP,
     config JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
 );
 
 -- 传感器数据表（时序表）
@@ -62,12 +64,13 @@ CREATE TABLE IF NOT EXISTS irrigation_schedules (
     humidity_threshold DECIMAL(5, 2),
     rain_sensor_id INTEGER REFERENCES devices(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
 );
 
 -- 触发方式枚举
 CREATE TYPE trigger_type AS ENUM ('manual', 'timed', 'conditional');
-CREATE TYPE execution_status AS ENUM ('success', 'failed', 'in_progress');
+CREATE TYPE execution_status AS ENUM ('success', 'failed', 'in_progress', 'skipped');
 
 -- 灌溉执行记录表
 CREATE TABLE IF NOT EXISTS irrigation_logs (
@@ -75,18 +78,24 @@ CREATE TABLE IF NOT EXISTS irrigation_logs (
     schedule_id INTEGER REFERENCES irrigation_schedules(id),
     zone_id INTEGER REFERENCES irrigation_zones(id),
     trigger_type trigger_type NOT NULL,
+    idempotency_key VARCHAR(100),
     start_time TIMESTAMP NOT NULL,
     end_time TIMESTAMP,
     duration INTEGER,
     water_usage DECIMAL(10, 2),
     status execution_status NOT NULL,
     error_message TEXT,
+    skip_reason TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 创建索引
 CREATE INDEX IF NOT EXISTS idx_irrigation_logs_zone_time ON irrigation_logs(zone_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_irrigation_logs_time ON irrigation_logs(start_time);
+-- 幂等键唯一：同一键重复调用返回原执行记录
+CREATE UNIQUE INDEX IF NOT EXISTS idx_irrigation_logs_idempotency_key ON irrigation_logs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- 同一区域同一时间只允许一条进行中的执行记录（并发安全）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_irrigation_logs_zone_in_progress ON irrigation_logs(zone_id) WHERE status = 'in_progress';
 
 -- 告警类型枚举
 CREATE TYPE alert_type AS ENUM ('device_offline', 'sensor_abnormal', 'irrigation_failed');
@@ -128,8 +137,8 @@ CREATE TABLE IF NOT EXISTS system_configs (
 );
 
 -- 插入默认管理员用户 (密码: admin123)
-INSERT INTO users (username, password_hash, email) 
-VALUES ('admin', '$2a$10$N9qo8uLOickgx2ZMRZoMye.IjZ6H5Nk2b1m0G0tN5wWJjwY1Xm4yK', 'admin@example.com')
+INSERT INTO users (username, password_hash, email)
+VALUES ('admin', '$2a$10$NgUq3xV947g6DDcvoYZ6R..ei9LpOJuMxeL6bgRwnK/qz4i/ZTq0i', 'admin@example.com')
 ON CONFLICT (username) DO NOTHING;
 
 -- 插入默认系统配置
