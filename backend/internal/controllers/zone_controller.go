@@ -11,12 +11,14 @@ import (
 )
 
 type ZoneController struct {
-	zoneService *services.ZoneService
+	zoneService       *services.ZoneService
+	irrigationService *services.IrrigationService
 }
 
 func NewZoneController() *ZoneController {
 	return &ZoneController{
-		zoneService: services.NewZoneService(),
+		zoneService:       services.NewZoneService(),
+		irrigationService: services.NewIrrigationService(),
 	}
 }
 
@@ -37,14 +39,22 @@ func (c *ZoneController) List(ctx *gin.Context) {
 	response.Success(ctx, zones)
 }
 
+// ZoneDetail 区域详情：区域信息 + 当前执行 + 熔断状态 + 最近记录
+type ZoneDetail struct {
+	*models.IrrigationZone
+	CurrentExecution *models.IrrigationLog          `json:"current_execution"`
+	CircuitBreaker   *services.CircuitBreakerStatus `json:"circuit_breaker"`
+	RecentLogs       []models.IrrigationLog         `json:"recent_logs"`
+}
+
 // GetZone godoc
 // @Summary 获取灌溉区域详情
-// @Description 根据ID获取灌溉区域详情
+// @Description 根据ID获取灌溉区域详情，包含当前执行、熔断状态和最近记录
 // @Tags 灌溉区域
 // @Security ApiKeyAuth
 // @Produce json
 // @Param id path int true "区域ID"
-// @Success 200 {object} models.IrrigationZone
+// @Success 200 {object} controllers.ZoneDetail
 // @Router /api/zones/{id} [get]
 func (c *ZoneController) Get(ctx *gin.Context) {
 	id, _ := strconv.ParseUint(ctx.Param("id"), 10, 32)
@@ -53,7 +63,19 @@ func (c *ZoneController) Get(ctx *gin.Context) {
 		response.NotFound(ctx, "Zone not found")
 		return
 	}
-	response.Success(ctx, zone)
+
+	execStatus, err := c.irrigationService.GetZoneExecutionStatus(uint(id), 10)
+	if err != nil {
+		response.InternalServerError(ctx, err.Error())
+		return
+	}
+
+	response.Success(ctx, ZoneDetail{
+		IrrigationZone:   zone,
+		CurrentExecution: execStatus.CurrentExecution,
+		CircuitBreaker:   execStatus.CircuitBreaker,
+		RecentLogs:       execStatus.RecentLogs,
+	})
 }
 
 // CreateZone godoc
@@ -94,7 +116,7 @@ func (c *ZoneController) Create(ctx *gin.Context) {
 // @Router /api/zones/{id} [put]
 func (c *ZoneController) Update(ctx *gin.Context) {
 	id, _ := strconv.ParseUint(ctx.Param("id"), 10, 32)
-	
+
 	var updates map[string]interface{}
 	if err := ctx.ShouldBindJSON(&updates); err != nil {
 		response.BadRequest(ctx, "Invalid request body")
@@ -120,7 +142,7 @@ func (c *ZoneController) Update(ctx *gin.Context) {
 // @Router /api/zones/{id} [delete]
 func (c *ZoneController) Delete(ctx *gin.Context) {
 	id, _ := strconv.ParseUint(ctx.Param("id"), 10, 32)
-	
+
 	if err := c.zoneService.DeleteZone(uint(id)); err != nil {
 		response.NotFound(ctx, err.Error())
 		return

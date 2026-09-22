@@ -5,8 +5,11 @@ CREATE TABLE IF NOT EXISTS irrigation_zones (
     id SERIAL PRIMARY KEY,
     name VARCHAR(100) NOT NULL,
     description TEXT,
+    consecutive_failures INTEGER DEFAULT 0,
+    circuit_open_until TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
 );
 
 -- 设备类型枚举
@@ -24,7 +27,8 @@ CREATE TABLE IF NOT EXISTS devices (
     last_heartbeat TIMESTAMP,
     config JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
 );
 
 -- 传感器数据表（时序表）
@@ -62,12 +66,13 @@ CREATE TABLE IF NOT EXISTS irrigation_schedules (
     humidity_threshold DECIMAL(5, 2),
     rain_sensor_id INTEGER REFERENCES devices(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP
 );
 
 -- 触发方式枚举
 CREATE TYPE trigger_type AS ENUM ('manual', 'timed', 'conditional');
-CREATE TYPE execution_status AS ENUM ('success', 'failed', 'in_progress');
+CREATE TYPE execution_status AS ENUM ('success', 'failed', 'in_progress', 'skipped');
 
 -- 灌溉执行记录表
 CREATE TABLE IF NOT EXISTS irrigation_logs (
@@ -81,12 +86,19 @@ CREATE TABLE IF NOT EXISTS irrigation_logs (
     water_usage DECIMAL(10, 2),
     status execution_status NOT NULL,
     error_message TEXT,
+    idempotency_key VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 创建索引
 CREATE INDEX IF NOT EXISTS idx_irrigation_logs_zone_time ON irrigation_logs(zone_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_irrigation_logs_time ON irrigation_logs(start_time);
+-- 幂等键唯一：同一键重复启动返回原执行记录
+CREATE UNIQUE INDEX IF NOT EXISTS idx_irrigation_logs_idempotency_key
+    ON irrigation_logs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- 区域互斥：同一区域同一时刻只允许一条进行中的执行记录
+CREATE UNIQUE INDEX IF NOT EXISTS idx_irrigation_logs_zone_in_progress
+    ON irrigation_logs(zone_id) WHERE status = 'in_progress';
 
 -- 告警类型枚举
 CREATE TYPE alert_type AS ENUM ('device_offline', 'sensor_abnormal', 'irrigation_failed');
@@ -128,14 +140,18 @@ CREATE TABLE IF NOT EXISTS system_configs (
 );
 
 -- 插入默认管理员用户 (密码: admin123)
-INSERT INTO users (username, password_hash, email) 
-VALUES ('admin', '$2a$10$N9qo8uLOickgx2ZMRZoMye.IjZ6H5Nk2b1m0G0tN5wWJjwY1Xm4yK', 'admin@example.com')
+INSERT INTO users (username, password_hash, email)
+VALUES ('admin', '$2a$10$qUaytbJcivVzlf58DrzpdOMaXtYRImfv9IbTA7jegRB32UiI883Qi', 'admin@example.com')
 ON CONFLICT (username) DO NOTHING;
 
 -- 插入默认系统配置
-INSERT INTO system_configs (key, value, description) VALUES 
+INSERT INTO system_configs (key, value, description) VALUES
 ('water_saving_mode', 'false', '节水模式'),
 ('preferred_irrigation_start', '06:00', '偏好灌溉开始时间'),
 ('preferred_irrigation_end', '08:00', '偏好灌溉结束时间'),
-('device_heartbeat_timeout', '300', '设备心跳超时时间（秒）')
+('device_heartbeat_timeout', '300', '设备心跳超时时间（秒）'),
+('rainfall_skip_threshold_mm', '5', '启动前两小时降雨量跳过阈值（毫米）'),
+('rainfall_check_window_hours', '2', '启动前降雨量检查窗口（小时）'),
+('circuit_breaker_threshold', '3', '区域连续失败熔断阈值（次）'),
+('circuit_breaker_cooldown_minutes', '30', '熔断冷却时长（分钟）')
 ON CONFLICT (key) DO NOTHING;
